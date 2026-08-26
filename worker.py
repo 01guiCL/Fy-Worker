@@ -9,6 +9,10 @@
 # sem precisar de ser convidada explicitamente.
 # ================================
 
+# ================================
+# worker.py (versão atualizada — tracking em Drive, não em Sheet)
+# ================================
+
 import sys
 import os
 import re
@@ -21,8 +25,9 @@ from mutagen.id3 import ID3, COMM
 from mutagen.mp3 import MP3
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import gspread
+import io
 
 # --------------------------------
 # 1. Argumentos recebidos (utilizador + link da playlist)
@@ -45,15 +50,14 @@ gc = gspread.authorize(creds)
 
 SHEET_ID = os.environ["SHEET_ID"]
 sh = gc.open_by_key(SHEET_ID)
-aba_utilizadores = sh.worksheet("Utilizadores")
-aba_processadas = sh.worksheet("Musicas_Processadas")
+aba_userbase = sh.worksheet("Userbase")  # <-- CORRIGIDO: nome da aba
 
 PASTA_TEMP = "/tmp/musica_temp"
 os.makedirs(PASTA_TEMP, exist_ok=True)
 
 
 # --------------------------------
-# 3. Funções auxiliares
+# 3. Funções auxiliares — Drive genéricas
 # --------------------------------
 
 def nome_ficheiro_seguro(texto):
@@ -63,10 +67,7 @@ def nome_ficheiro_seguro(texto):
 
 
 def extrair_id_da_pasta(link_drive):
-    """
-    Extrai o ID da pasta a partir de um link do tipo:
-    https://drive.google.com/drive/folders/ESTE_ID_AQUI?usp=sharing
-    """
+    """Extrai o ID da pasta a partir de um link do tipo .../folders/ESTE_ID."""
     match = re.search(r"/folders/([a-zA-Z0-9_-]+)", link_drive)
     if match:
         return match.group(1)
@@ -74,11 +75,7 @@ def extrair_id_da_pasta(link_drive):
 
 
 def encontrar_ou_criar_subpasta(nome_pasta, id_pasta_pai):
-    """
-    Procura uma subpasta com este nome dentro da pasta pai.
-    Se não existir, cria-a. Evita duplicar pastas em execuções repetidas
-    (importante para poder "retomar" um processamento interrompido).
-    """
+    """Procura (ou cria) uma subpasta com este nome dentro da pasta pai."""
     query = (
         f"name = '{nome_pasta}' and '{id_pasta_pai}' in parents "
         f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -100,6 +97,108 @@ def encontrar_ou_criar_subpasta(nome_pasta, id_pasta_pai):
     return nova["id"]
 
 
+def procurar_ficheiro_na_pasta(nome_ficheiro, id_pasta):
+    """
+    Procura um ficheiro pelo nome dentro de uma pasta específica.
+    Devolve o ID do ficheiro se existir, ou None se não existir.
+    """
+    query = f"name = '{nome_ficheiro}' and '{id_pasta}' in parents and trashed = false"
+    resultado = drive_service.files().list(
+        q=query, fields="files(id)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
+    encontrados = resultado.get("files", [])
+    return encontrados[0]["id"] if encontrados else None
+
+
+def upload_ficheiro_para_drive(caminho_local, nome_no_drive, id_pasta_destino, mime_type):
+    """Faz upload (ou atualiza, se já existir) um ficheiro numa pasta do Drive."""
+    file_id_existente = procurar_ficheiro_na_pasta(nome_no_drive, id_pasta_destino)
+    media = MediaFileUpload(caminho_local, mimetype=mime_type, resumable=True)
+
+    if file_id_existente:
+        drive_service.files().update(
+            fileId=file_id_existente, media_body=media, supportsAllDrives=True
+        ).execute()
+    else:
+        metadata = {"name": nome_no_drive, "parents": [id_pasta_destino]}
+        drive_service.files().create(
+            body=metadata, media_body=media, fields="id", supportsAllDrives=True
+        ).execute()
+
+
+# --------------------------------
+# 4. NOVO — Ler e gravar JSON de tracking dentro de UserData (em vez da Sheet)
+# --------------------------------
+
+def ler_json_do_drive(nome_ficheiro, id_pasta, valor_default):
+    """
+    Descarrega um ficheiro JSON de uma pasta do Drive e devolve-o já convertido
+    em dicionário/lista Python. Se o ficheiro ainda não existir (primeira vez
+    que este utilizador sincroniza), devolve o valor_default (normalmente {}).
+    """
+    file_id = procurar_ficheiro_na_pasta(nome_ficheiro, id_pasta)
+    if not file_id:
+        return valor_default
+
+    # Descarrega o conteúdo do ficheiro para memória (sem gravar em disco)
+    pedido = drive_service.files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, pedido)
+    concluido = False
+    while not concluido:
+        _, concluido = downloader.next_chunk()
+
+    buffer.seek(0)
+    try:
+        return json.loads(buffer.read().decode("utf-8"))
+    except json.JSONDecodeError:
+        # Ficheiro corrompido ou vazio -> começa do zero em vez de rebentar
+        print(f"⚠️ '{nome_ficheiro}' não é um JSON válido, a começar do zero.")
+        return valor_default
+
+
+def guardar_json_no_drive(dados, nome_ficheiro, id_pasta):
+    """
+    Grava um dicionário/lista Python como ficheiro JSON dentro de uma pasta do Drive
+    (cria um ficheiro local temporário e faz upload/atualização).
+    """
+    caminho_local = os.path.join(PASTA_TEMP, nome_ficheiro)
+    with open(caminho_local, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=2)
+
+    upload_ficheiro_para_drive(caminho_local, nome_ficheiro, id_pasta, "application/json")
+    os.remove(caminho_local)
+
+
+def obter_ids_ja_processados(registo_processadas, nome_playlist):
+    """
+    Recebe o dicionário completo já carregado (todas as playlists) e devolve
+    o conjunto de youtube_ids já feitos APENAS para a playlist atual.
+    """
+    lista_da_playlist = registo_processadas.get(nome_playlist, [])
+    return {item["youtube_id"] for item in lista_da_playlist}
+
+
+def registar_musica_processada(registo_processadas, nome_playlist, youtube_id, titulo):
+    """
+    Adiciona uma música ao dicionário em memória (ainda não grava no Drive —
+    isso só acontece uma vez no fim, para não fazer upload a cada música).
+    """
+    if nome_playlist not in registo_processadas:
+        registo_processadas[nome_playlist] = []
+
+    registo_processadas[nome_playlist].append({
+        "youtube_id": youtube_id,
+        "titulo": titulo,
+        "data": time.strftime("%Y-%m-%d %H:%M:%S")
+    })
+
+
+# --------------------------------
+# 5. LRCLIB e processamento de cada música (sem alterações)
+# --------------------------------
+
 def procurar_letra_lrclib(titulo, artista, duracao_segundos):
     """Consulta a API pública do LRCLIB à procura de letras sincronizadas (.lrc)."""
     try:
@@ -115,52 +214,14 @@ def procurar_letra_lrclib(titulo, artista, duracao_segundos):
     return None
 
 
-def upload_ficheiro_para_drive(caminho_local, nome_no_drive, id_pasta_destino, mime_type):
-    """Faz upload (ou atualiza, se já existir) um ficheiro numa pasta do Drive."""
-    query = f"name = '{nome_no_drive}' and '{id_pasta_destino}' in parents and trashed = false"
-    resultado = drive_service.files().list(
-        q=query, fields="files(id)",
-        supportsAllDrives=True, includeItemsFromAllDrives=True
-    ).execute()
-    existentes = resultado.get("files", [])
-
-    media = MediaFileUpload(caminho_local, mimetype=mime_type, resumable=True)
-
-    if existentes:
-        drive_service.files().update(
-            fileId=existentes[0]["id"], media_body=media, supportsAllDrives=True
-        ).execute()
-    else:
-        metadata = {"name": nome_no_drive, "parents": [id_pasta_destino]}
-        drive_service.files().create(
-            body=metadata, media_body=media, fields="id", supportsAllDrives=True
-        ).execute()
-
-
-def obter_ids_ja_processados(utilizador, nome_playlist):
-    """Evita repetir músicas já descarregadas anteriormente (permite retomar sem duplicar)."""
-    registos = aba_processadas.get_all_records()
-    return {
-        str(r.get("youtube_id"))
-        for r in registos
-        if str(r.get("utilizador")) == utilizador and str(r.get("playlist")) == nome_playlist
-    }
-
-
-def registar_musica_processada(utilizador, youtube_id, titulo, nome_playlist):
-    """Regista na aba 'Musicas_Processadas' que esta música já foi tratada."""
-    aba_processadas.append_row(
-        [utilizador, youtube_id, titulo, nome_playlist, time.strftime("%Y-%m-%d %H:%M:%S")]
-    )
-
-
-def processar_uma_musica(video_info, id_pasta_playlist, utilizador, nome_playlist):
+def processar_uma_musica(video_info, id_pasta_playlist, nome_playlist, registo_processadas):
     """
     Descarrega UMA música:
     1. MP3 com thumbnail embutida (capa)
-    2. Link do YouTube guardado nos metadados (tag de comentário ID3) — serve de ID único
+    2. Link do YouTube guardado nos metadados (tag de comentário ID3) — ID único
     3. Letra sincronizada (.lrc) via LRCLIB
     4. Upload de ambos para a pasta da playlist no Drive
+    5. Regista no dicionário em memória (gravado no Drive no fim de tudo)
     """
     youtube_id = video_info["id"]
     url_video = f"https://www.youtube.com/watch?v={youtube_id}"
@@ -173,12 +234,12 @@ def processar_uma_musica(video_info, id_pasta_playlist, utilizador, nome_playlis
         "outtmpl": caminho_base + ".%(ext)s",
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-            {"key": "EmbedThumbnail"},   # embute a thumbnail como capa do MP3
-            {"key": "FFmpegMetadata"},   # escreve metadados básicos (título, etc)
+            {"key": "EmbedThumbnail"},
+            {"key": "FFmpegMetadata"},
         ],
         "writethumbnail": True,
         "quiet": True,
-        "noplaylist": True,  # download por vídeo individual, não pela playlist inteira
+        "noplaylist": True,
     }
     with yt_dlp.YoutubeDL(opcoes_ytdlp) as ydl:
         ydl.download([url_video])
@@ -188,7 +249,6 @@ def processar_uma_musica(video_info, id_pasta_playlist, utilizador, nome_playlis
         print(f"⚠️ Falhou o download de: {titulo_original}")
         return
 
-    # Guardar o link do YouTube nos metadados (campo "comentário" do ID3 = ID único)
     audio_tags = MP3(caminho_mp3, ID3=ID3)
     if audio_tags.tags is None:
         audio_tags.add_tags()
@@ -208,24 +268,23 @@ def processar_uma_musica(video_info, id_pasta_playlist, utilizador, nome_playlis
     else:
         print(f"ℹ️ Sem letra sincronizada para: {titulo_original}")
 
-    # Limpar ficheiros locais temporários (poupar espaço na máquina do GitHub Actions)
     for ext in [".mp3", ".lrc", ".jpg", ".webp", ".png"]:
         caminho_temp = caminho_base + ext
         if os.path.exists(caminho_temp):
             os.remove(caminho_temp)
 
-    # Regista como concluído (permite retomar sem repetir, se o processo for interrompido)
-    registar_musica_processada(utilizador, youtube_id, titulo_original, nome_playlist)
+    # Regista em memória — a gravação real no Drive acontece uma vez no fim (main())
+    registar_musica_processada(registo_processadas, nome_playlist, youtube_id, titulo_original)
     print(f"✅ Concluído: {titulo_original}")
 
 
 # --------------------------------
-# 4. Fluxo principal
+# 6. Fluxo principal
 # --------------------------------
 
 def main():
-    # 4.1 Buscar o link da pasta raiz do utilizador na aba "Utilizadores" (coluna C = drive_folder_link)
-    registos = aba_utilizadores.get_all_records()
+    # 6.1 Buscar o link da pasta raiz do utilizador na aba "Userbase" (coluna C = drive_folder_link)
+    registos = aba_userbase.get_all_records()
     link_pasta_utilizador = None
     for r in registos:
         if str(r.get("utilizador", "")).strip() == UTILIZADOR_ATUAL:
@@ -233,15 +292,19 @@ def main():
             break
 
     if not link_pasta_utilizador:
-        raise ValueError(f"Utilizador '{UTILIZADOR_ATUAL}' não encontrado na Sheet.")
+        raise ValueError(f"Utilizador '{UTILIZADOR_ATUAL}' não encontrado na aba Userbase.")
 
     id_pasta_raiz = extrair_id_da_pasta(link_pasta_utilizador)
 
-    # 4.2 Garante que existem as subpastas MusicData e UserData
+    # 6.2 Garante que existem as subpastas MusicData e UserData
     id_musicdata = encontrar_ou_criar_subpasta("MusicData", id_pasta_raiz)
-    encontrar_ou_criar_subpasta("UserData", id_pasta_raiz)  # reservada para histórico/preferências
+    id_userdata = encontrar_ou_criar_subpasta("UserData", id_pasta_raiz)
 
-    # 4.3 Ler informação da playlist do YouTube (sem descarregar ainda)
+    # 6.3 Carrega o registo de músicas já processadas (fica dentro de UserData)
+    NOME_FICHEIRO_TRACKING = "processed_tracks.json"
+    registo_processadas = ler_json_do_drive(NOME_FICHEIRO_TRACKING, id_userdata, valor_default={})
+
+    # 6.4 Ler informação da playlist do YouTube (sem descarregar ainda)
     opcoes_lista = {"quiet": True, "extract_flat": "in_playlist"}
     with yt_dlp.YoutubeDL(opcoes_lista) as ydl:
         info_playlist = ydl.extract_info(PLAYLIST_URL, download=False)
@@ -252,10 +315,10 @@ def main():
 
     id_pasta_playlist = encontrar_ou_criar_subpasta(nome_playlist, id_musicdata)
 
-    # 4.4 EXTRA: descarregar e enviar a capa da playlist
+    # 6.5 EXTRA: capa da playlist
     thumbs = info_playlist.get("thumbnails", [])
     if thumbs:
-        url_thumb = thumbs[-1]["url"]  # a última é normalmente a de maior resolução
+        url_thumb = thumbs[-1]["url"]
         caminho_capa = os.path.join(PASTA_TEMP, "cover_playlist.jpg")
         resposta_img = requests.get(url_thumb, timeout=15)
         with open(caminho_capa, "wb") as f:
@@ -264,8 +327,10 @@ def main():
         os.remove(caminho_capa)
         print("🖼️ Capa da playlist enviada.")
 
-    # 4.5 Processar cada música que ainda falta (salta as já feitas)
-    ids_feitos = obter_ids_ja_processados(UTILIZADOR_ATUAL, nome_playlist)
+    # 6.6 Processar cada música que ainda falta
+    ids_feitos = obter_ids_ja_processados(registo_processadas, nome_playlist)
+    houve_alteracoes = False
+
     for video in videos:
         yid = video.get("id")
         if not yid:
@@ -274,10 +339,15 @@ def main():
             print(f"⏭️ Já processado, a saltar: {video.get('title')}")
             continue
         try:
-            processar_uma_musica(video, id_pasta_playlist, UTILIZADOR_ATUAL, nome_playlist)
+            processar_uma_musica(video, id_pasta_playlist, nome_playlist, registo_processadas)
+            houve_alteracoes = True
         except Exception as erro:
-            # Uma música falhar não deve parar as restantes
             print(f"❌ Erro em '{video.get('title')}': {erro}")
+
+    # 6.7 Gravar o registo atualizado de volta no Drive (só se algo mudou, poupa uma chamada)
+    if houve_alteracoes:
+        guardar_json_no_drive(registo_processadas, NOME_FICHEIRO_TRACKING, id_userdata)
+        print("💾 Registo de músicas processadas atualizado no Drive.")
 
     print("🎉 Concluído.")
 
