@@ -1,0 +1,35 @@
+# ================================
+# Workflow do GitHub Actions
+# Ativado remotamente por um pedido HTTP vindo do Apps Script
+# (evento "repository_dispatch", tipo "nova_playlist")
+# ================================
+name: Processar Playlist
+
+on:
+  repository_dispatch:
+    types: [nova_playlist]
+
+jobs:
+  processar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descarregar o código do repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar ffmpeg (necessário para o yt-dlp converter para mp3)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Instalar dependências Python
+        run: pip install yt-dlp mutagen gspread google-auth google-api-python-client requests
+
+      - name: Correr o script de processamento
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          python worker.py "${{ github.event.client_payload.utilizador }}" "${{ github.event.client_payload.playlist_link }}"
