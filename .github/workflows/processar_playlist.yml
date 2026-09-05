@@ -14,6 +14,8 @@ jobs:
           python-version: "3.11"
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: pip install yt-dlp mutagen google-auth google-api-python-client requests
+      - name: Reconstruir ficheiro de cookies do YouTube
+        run: echo "${{ secrets.YOUTUBE_COOKIES_BASE64 }}" | base64 -d > cookies.txt
       - name: Correr o script de processamento
         run: |
           python worker.py "${{ github.event.client_payload.drive_folder_link }}" "${{ github.event.client_payload.playlist_link }}" "${{ github.event.client_payload.google_access_token }}"
