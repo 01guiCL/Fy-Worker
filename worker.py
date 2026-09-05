@@ -156,6 +156,7 @@ def processar_uma_musica(video_info, id_pasta_playlist, nome_playlist, registo_p
         "writethumbnail": True,
         "quiet": True,
         "noplaylist": True,
+        "cookiefile": "cookies.txt",
     }
     with yt_dlp.YoutubeDL(opcoes_ytdlp) as ydl:
         ydl.download([url_video])
@@ -199,7 +200,7 @@ def main():
     NOME_FICHEIRO_TRACKING = "processed_tracks.json"
     registo_processadas = ler_json_do_drive(NOME_FICHEIRO_TRACKING, id_userdata, valor_default={})
 
-    opcoes_lista = {"quiet": True, "extract_flat": "in_playlist"}
+    opcoes_lista = {"quiet": True, "extract_flat": "in_playlist", "cookiefile": "cookies.txt"}
     with yt_dlp.YoutubeDL(opcoes_lista) as ydl:
         info_playlist = ydl.extract_info(PLAYLIST_URL, download=False)
 
