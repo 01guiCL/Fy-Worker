@@ -163,7 +163,7 @@ def processar_uma_musica(video_info, id_pasta_playlist, nome_playlist, registo_p
         "writethumbnail": True,
         "quiet": True,
         "noplaylist": True,
-        "cookiefile": "cookies.txt",
+        # "cookiefile": "cookies.txt",
         # NOVO: contorna o erro "The page needs to be reloaded" com cookies ativos
         "extractor_args": YTDLP_EXTRACTOR_ARGS,
     }
@@ -214,7 +214,7 @@ def main():
     opcoes_lista = {
         "quiet": True,
         "extract_flat": "in_playlist",
-        "cookiefile": "cookies.txt",
+        # "cookiefile": "cookies.txt",
         # NOVO
         "extractor_args": YTDLP_EXTRACTOR_ARGS,
     }
