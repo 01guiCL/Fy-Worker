@@ -35,6 +35,13 @@ drive_service = build("drive", "v3", credentials=creds)
 PASTA_TEMP = "/tmp/musica_temp"
 os.makedirs(PASTA_TEMP, exist_ok=True)
 
+# --------------------------------
+# NOVO: opções extra do yt-dlp reutilizadas em todos os pedidos,
+# para contornar o erro "The page needs to be reloaded" que tem
+# aparecido quando se usam cookies com o cliente por defeito (tv_downgraded)
+# --------------------------------
+YTDLP_EXTRACTOR_ARGS = {"youtube": {"player_client": ["default", "web_embedded"]}}
+
 
 # --------------------------------
 # 3. Funções auxiliares (Drive)
@@ -157,6 +164,8 @@ def processar_uma_musica(video_info, id_pasta_playlist, nome_playlist, registo_p
         "quiet": True,
         "noplaylist": True,
         "cookiefile": "cookies.txt",
+        # NOVO: contorna o erro "The page needs to be reloaded" com cookies ativos
+        "extractor_args": YTDLP_EXTRACTOR_ARGS,
     }
     with yt_dlp.YoutubeDL(opcoes_ytdlp) as ydl:
         ydl.download([url_video])
@@ -182,6 +191,8 @@ def processar_uma_musica(video_info, id_pasta_playlist, nome_playlist, registo_p
         with open(caminho_lrc, "w", encoding="utf-8") as f:
             f.write(letra_lrc)
         upload_ficheiro_para_drive(caminho_lrc, titulo_seguro + ".lrc", id_pasta_playlist, "text/plain")
+    else:
+        print(f"ℹ️ Sem letra sincronizada para: {titulo_original}")
 
     for ext in [".mp3", ".lrc", ".jpg", ".webp", ".png"]:
         caminho_temp = caminho_base + ext
@@ -200,7 +211,13 @@ def main():
     NOME_FICHEIRO_TRACKING = "processed_tracks.json"
     registo_processadas = ler_json_do_drive(NOME_FICHEIRO_TRACKING, id_userdata, valor_default={})
 
-    opcoes_lista = {"quiet": True, "extract_flat": "in_playlist", "cookiefile": "cookies.txt"}
+    opcoes_lista = {
+        "quiet": True,
+        "extract_flat": "in_playlist",
+        "cookiefile": "cookies.txt",
+        # NOVO
+        "extractor_args": YTDLP_EXTRACTOR_ARGS,
+    }
     with yt_dlp.YoutubeDL(opcoes_lista) as ydl:
         info_playlist = ydl.extract_info(PLAYLIST_URL, download=False)
 
@@ -219,6 +236,7 @@ def main():
             f.write(resposta_img.content)
         upload_ficheiro_para_drive(caminho_capa, "cover.jpg", id_pasta_playlist, "image/jpeg")
         os.remove(caminho_capa)
+        print("🖼️ Capa da playlist enviada.")
 
     ids_feitos = obter_ids_ja_processados(registo_processadas, nome_playlist)
     houve_alteracoes = False
@@ -235,6 +253,7 @@ def main():
 
     if houve_alteracoes:
         guardar_json_no_drive(registo_processadas, NOME_FICHEIRO_TRACKING, id_userdata)
+        print("💾 Registo de músicas processadas atualizado no Drive.")
 
     print("🎉 Concluído.")
 
